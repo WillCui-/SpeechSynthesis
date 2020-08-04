@@ -1,0 +1,4 @@
+for i in {1..9};
+do
+	sox recordings/arctic_a000$i.wav -b16 -r 16k wav/arctic_a000$i.wav
+done

@@ -1,0 +1,145 @@
+#!/bin/bash
+
+# currently assumes: phone_list, substitutions,  train_subset.scp
+
+root=$1
+
+if [ ! -d "$root" ] ; then
+    echo "Usage: $0 root_directory"
+    exit 1
+fi
+
+##
+## GENERAL SETUP
+##
+
+
+echo "CHANGING DIRECTORY to" $root
+cd $root
+
+echo "CHECKING FOR FILES"
+if [ ! -r "phone_list" ] ; then
+    echo "phone_list not found"
+    exit 1
+fi
+if [ ! -r "phone_substitutions" ] ; then
+    echo "phone_substitutions not found"
+    exit 1
+fi
+if [ ! -r "train.scp" ] ; then
+    echo "train.scp not found"
+    exit 1
+fi
+
+
+# create dict and dict2
+echo "CREATING DICT"
+awk '{print $1 " " $1}' phone_list > dict
+echo "CREATING DICT2 with phone substitutions"
+cat dict phone_substitutions > dict2
+
+# Generate Master Model file
+echo "CREATING MASTER MODEL FILE"
+
+echo " CALCULATING VARIANCE FLOOR using HCompV"
+mkdir -p hmm0
+HCompV -C config -f 0.01 -m -S train_subset.scp -M hmm0 proto/5states
+if [ $? -gt 0 ] ; then echo "Set varience floor failed, Aborted!" ; exit 1 ; fi
+
+# create models
+echo " GENERATING MODELS"
+for m in `cat phone_list` ; do
+    if [ "$m" != "sp" ] ; then
+	grep -v "~h" hmm0/5states > hmm0/$m
+    else 
+	cp proto/3states hmm0/$m
+    fi
+done
+
+HHEd -d hmm0 -w hmm0/MMF resources/tie_silence.hed phone_list
+if [ $? -gt 0 ] ; then echo "Build master model file failed, Aborted!" ; exit 1 ; fi
+
+for m in `cat phone_list` ; do
+    echo
+    #rm -f hmm0/$m hmm0/5states
+done
+
+###
+### INITIAL TRAINING
+###
+
+i=0
+
+# This sometimes helps HTK problems, even though it shouldn't do anything.
+cp ../utts.mlf aligned.0.mlf
+
+# Re-estimation
+for j in 1 2 3 4 5; do
+echo "RE-ESTIMATING MODEL PARAMETERS (ITERATION $i of 5)"
+    mkdir -p hmm$[$i +1]
+    HERest -C config -T 1023 -t 250.0 150.0 1000.0 -H hmm${i}/MMF -H hmm0/vFloors -I aligned.0.mlf -M hmm$[$i +1] -S train_subset.scp phone_list
+    if [ $? -gt 0 ] ; then echo "Re-estimation $i failed, Aborted!" ; exit 1 ; fi
+    i=$[$i + 1]
+done
+
+
+P1=1000       # initial beamsearch thresh for HVite
+P2=100000     # if aligning fails, increase by that amout
+P3=1000000    # up to this number
+
+# Realignment to correct labelling:
+echo "FIRST ALIGNMENT AND VOWEL REDUCTION"
+HVite -l \* -C config  -a -m -I ../utts.mlf -H hmm${i}/MMF -i aligned.1.mlf -m \
+      -t $P1 $P2 $P3  -S train.scp -y lab dict2 phone_list
+if [ $? -gt 0 ] ; then echo "First alignment failed, Aborted!" ; exit 1 ; fi
+
+if [ `egrep lab aligned.1.mlf|wc -l` != `egrep lab aligned.0.mlf|wc -l` ] ; then
+    echo "alignment failed for the following file(s):"
+    egrep lab aligned.0.mlf > aligned.0.uttlist
+    egrep lab aligned.1.mlf > aligned.1.uttlist
+    comm -23 aligned.0.uttlist aligned.1.uttlist
+    echo "try a larger beam search thresh for HVite.  Aborted!"
+    exit 1
+fi
+
+# Reestimate a few more times
+for j in 1 2 3 4 ; do
+echo "RE-ESTIMATING MODEL PARAMETERS (ITERATION $i)"
+    mkdir -p hmm$[$i +1]
+    HERest -C config -T 1 -t 250.0 150.0 1000.0 -H hmm${i}/MMF -H hmm0/vFloors -I aligned.1.mlf -M hmm$[$i +1] -S train_subset.scp phone_list
+    if [ $? -gt 0 ] ; then echo "Re-estimation $i  failed, Aborted!" ; exit 1 ; fi
+    i=$[$i + 1]
+done
+
+# Realign      - use original labels and redo label correction (good idea?)
+echo "REALIGNMENT"
+HVite -l \* -C config -a  -m -i aligned.2.mlf -I ../utts.mlf -T 1  -H hmm${i}/MMF  -S train.scp -y lab dict2 phone_list 
+if [ $? -gt 0 ] ; then echo "second alignment failed, Aborted!" ; exit 1 ; fi
+
+###
+### INCREASE MISTURES
+###
+
+# Increase mixtures.
+
+for m in 2 3 5 8 ; do
+    echo "INCREASING MIXTURES TO $m"  
+    mkdir -p hmm$[$i +1]
+    HHEd -C config -H hmm${i}/MMF -M hmm$[$i + 1] resources/mixup${m}.hed phone_list
+    if [ $? -gt 0 ] ; then echo "Mixup to $m mixtures failed, Aborted!" ; exit 1 ; fi
+    i=$[$i + 1]
+    for j in 1 2 3; do
+        echo "RE-ESTIMATING MODEL PARAMETERS (ITERATION $i)"
+	mkdir -p hmm$[$i +1]
+	HERest -C config -T 1 -t 250.0 150.0 1000.0 -H hmm${i}/MMF -H hmm0/vFloors -I aligned.2.mlf -M hmm$[$i + 1] -S train_subset.scp phone_list
+	if [ $? -gt 0 ] ; then echo "Re-estimation $i failed, Aborted!" ; exit 1 ; fi
+	i=$[$i + 1]
+    done
+
+done
+
+# Final alignment
+
+echo "FINAL ALIGNMENT"
+HVite -l \* -C config -a -m -i aligned.3.mlf -I ../utts.mlf -T 1  -H hmm${i}/MMF  dict2 phone_list -S train.scp
+if [ $? -gt 0 ] ; then echo "Final alignment failed, Aborted!" ; exit 1 ; fi
